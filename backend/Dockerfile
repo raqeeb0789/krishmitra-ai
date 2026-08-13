@@ -1,61 +1,59 @@
 # syntax=docker/dockerfile:1
 
-# Use the official UV Python base image with Python 3.13 on Debian Bookworm
-# UV is a fast Python package manager that provides better performance than pip
-# We use the slim variant to keep the image size smaller while still having essential tools
 ARG PYTHON_VERSION=3.13
+
 FROM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-bookworm-slim AS base
 
-# Keeps Python from buffering stdout and stderr to avoid situations where
-# the application crashes without emitting any logs due to buffering.
 ENV PYTHONUNBUFFERED=1
 
-# --- Build stage ---
-# Install dependencies, build native extensions, and prepare the application
+# ============================================================
+# BUILD STAGE
+# ============================================================
+
 FROM base AS build
 
-# Install build dependencies required for Python packages with native extensions
-# gcc: C compiler needed for building Python packages with C extensions
-# g++: C++ compiler needed for building Python packages with C++ extensions
-# python3-dev: Python development headers needed for compilation
-# We clean up the apt cache after installation to keep the image size down
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     python3-dev \
-  && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
-# Create a new directory for our application code
-# And set it as the working directory
 WORKDIR /app
 
-# Copy just the dependency files first, for more efficient layer caching
-COPY pyproject.toml uv.lock ./
-RUN mkdir -p src
+# Cache locations
+ENV HOME=/app
+ENV XDG_CACHE_HOME=/app/.cache
+ENV UV_CACHE_DIR=/app/.cache/uv
+ENV HF_HOME=/app/.cache/huggingface
+ENV HUGGINGFACE_HUB_CACHE=/app/.cache/huggingface/hub
 
-# Install Python dependencies using UV's lock file
-# --locked ensures we use exact versions from uv.lock for reproducible builds
-# This creates a virtual environment and installs all dependencies
-# Ensure your uv.lock file is checked in for consistency across environments
+# Copy dependency files
+COPY pyproject.toml uv.lock ./
+
+# IMPORTANT:
+# uv sync expects the src directory because
+# pyproject.toml defines a src-based package.
+RUN mkdir -p /app/src
+
+# Install dependencies
 RUN uv sync --locked
 
-# Copy all remaining application files into the container
-# This includes source code, configuration files, and dependency specifications
-# (Excludes files specified in .dockerignore)
+# Now copy the actual source code
 COPY . .
 
-# Pre-download any ML models or files the agent needs
-# This ensures the container is ready to run immediately without downloading
-# dependencies at runtime, which improves startup time and reliability
-RUN uv run "src/agent.py" download-files
+# Download LiveKit models/files
+RUN uv run src/agent.py download-files
 
-# --- Production stage ---
-# Build tools (gcc, g++, python3-dev) are not included in the final image
+# ============================================================
+# PRODUCTION STAGE
+# ============================================================
+
 FROM base
 
-# Create a non-privileged user that the app will run under.
-# See https://docs.docker.com/build/building/best-practices/#user
+WORKDIR /app
+
 ARG UID=10001
+
 RUN adduser \
     --disabled-password \
     --gecos "" \
@@ -64,15 +62,23 @@ RUN adduser \
     --uid "${UID}" \
     appuser
 
-# Copy the application and virtual environment with correct ownership in a single layer
-# This avoids expensive recursive chown and excludes build tools from the final image
+# Copy everything including:
+# .venv
+# source code
+# downloaded LiveKit models
+# cache
 COPY --from=build --chown=appuser:appuser /app /app
 
-# Switch to the non-privileged user for all subsequent operations
-# This improves security by not running as root
+# Runtime cache locations
+ENV HOME=/app
+ENV XDG_CACHE_HOME=/app/.cache
+ENV UV_CACHE_DIR=/app/.cache/uv
+ENV HF_HOME=/app/.cache/huggingface
+ENV HUGGINGFACE_HUB_CACHE=/app/.cache/huggingface/hub
+
+# Ensure permissions
+RUN chown -R appuser:appuser /app
+
 USER appuser
 
-# Run the AgentServer using UV
-# UV will activate the virtual environment and run the agent.
-# The "start" command tells the AgentServer to connect to LiveKit and begin waiting for jobs.
-CMD ["uv", "run", "src/agent.py", "start"]
+CMD ["uv", "run", "--no-project", "src/agent.py", "start"]
